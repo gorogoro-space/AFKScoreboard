@@ -1,0 +1,12 @@
+name: AFKScoreboard
+version: '${version}'
+softdepend: [AxAFKZone]
+main: space.gorogoro.afkscoreboard.AFKScoreboard
+api-version: '1.21.11'
+description: This plugin works with AxAFKZone to display a ranking scoreboard based on AFK time.
+author: kubotan
+website: https://www.gorogoro.space/
+
+commands:
+  afkhide:
+    description: 放置ランキングから自分を表示/非表示できます
