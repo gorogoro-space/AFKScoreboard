@@ -390,6 +390,11 @@ final class CosmeticService implements Listener {
                 }
             }
         }
+        // 透明な間(GSit の /lay など)はバニラと同じく名前を出さない。/lay では GSit の寝姿に名前が出るので二重になる
+        if (state.rider != null && state.rider.isValid()
+                && state.rider.isCustomNameVisible() == player.isInvisible()) {
+            state.rider.setCustomNameVisible(!player.isInvisible());
+        }
 
         syncNameTag(player, state);
     }
@@ -999,9 +1004,10 @@ final class CosmeticService implements Listener {
     /**
      * 何かが乗っているプレイヤーのネームタグは、クライアントが表示しない。
      * ブロックだけが乗っている間は、代わりに名前の TextDisplay を頭の上に乗せる(頭上 MOB がいるときは MOB の名前で足りる)。
+     * 透明な間はバニラと同じく出さない。
      */
     private void syncNameTag(Player player, Active state) {
-        boolean needed = !state.displays.isEmpty() && state.rider == null;
+        boolean needed = !state.displays.isEmpty() && state.rider == null && !player.isInvisible();
         if (!needed) {
             removeNameTag(state);
             return;
