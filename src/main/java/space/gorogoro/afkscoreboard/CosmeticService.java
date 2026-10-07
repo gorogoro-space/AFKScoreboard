@@ -53,7 +53,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.CreeperPowerEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
-import org.bukkit.event.entity.EntityDismountEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityMountEvent;
 import org.bukkit.event.entity.ExplosionPrimeEvent;
@@ -94,7 +93,6 @@ final class CosmeticService implements Listener {
 
     private final Map<UUID, Active> active = new HashMap<>();
     private int weekClock;
-    private boolean allowDismount;
 
     CosmeticService(AFKScoreboard plugin) {
         this.plugin = plugin;
@@ -127,15 +125,10 @@ final class CosmeticService implements Listener {
     }
 
     void removeAll() {
-        allowDismount = true;
-        try {
-            for (UUID uuid : new ArrayList<>(active.keySet())) {
-                clear(Bukkit.getPlayer(uuid), uuid);
-            }
-            removeStrayEntities();
-        } finally {
-            allowDismount = false;
+        for (UUID uuid : new ArrayList<>(active.keySet())) {
+            clear(Bukkit.getPlayer(uuid), uuid);
         }
+        removeStrayEntities();
     }
 
     /**
@@ -433,20 +426,14 @@ final class CosmeticService implements Listener {
     }
 
     private void clear(Player player, UUID uuid) {
-        boolean outer = allowDismount;
-        allowDismount = true;
-        try {
-            Active state = active.remove(uuid);
-            if (state != null) {
-                removeDisplays(state);
-                removeRider(state);
-                removeNameTag(state);
-            }
-            if (player != null) {
-                stripPassengers(player);
-            }
-        } finally {
-            allowDismount = outer;
+        Active state = active.remove(uuid);
+        if (state != null) {
+            removeDisplays(state);
+            removeRider(state);
+            removeNameTag(state);
+        }
+        if (player != null) {
+            stripPassengers(player);
         }
     }
 
@@ -957,17 +944,10 @@ final class CosmeticService implements Listener {
     }
 
     private void removeDisplays(Active state) {
-        // 自分で消すときは降車を止めない。止めると消えたまま乗り続け、毎 tick 降車処理が走る
-        boolean outer = allowDismount;
-        allowDismount = true;
-        try {
-            for (BlockDisplay display : state.displays) {
-                if (display != null && display.isValid()) {
-                    display.remove();
-                }
+        for (BlockDisplay display : state.displays) {
+            if (display != null && display.isValid()) {
+                display.remove();
             }
-        } finally {
-            allowDismount = outer;
         }
         state.displays.clear();
         state.floorDisplays.clear();
@@ -988,15 +968,8 @@ final class CosmeticService implements Listener {
     }
 
     private void removeRider(Active state) {
-        // 自分で消すときは降車を止めない(removeDisplays と同じ理由)
-        boolean outer = allowDismount;
-        allowDismount = true;
-        try {
-            if (state.rider != null && state.rider.isValid()) {
-                state.rider.remove();
-            }
-        } finally {
-            allowDismount = outer;
+        if (state.rider != null && state.rider.isValid()) {
+            state.rider.remove();
         }
         state.rider = null;
     }
@@ -1047,15 +1020,8 @@ final class CosmeticService implements Listener {
     }
 
     private void removeNameTag(Active state) {
-        // 自分で消すときは降車を止めない(removeDisplays と同じ理由)
-        boolean outer = allowDismount;
-        allowDismount = true;
-        try {
-            if (state.nameTag != null && state.nameTag.isValid()) {
-                state.nameTag.remove();
-            }
-        } finally {
-            allowDismount = outer;
+        if (state.nameTag != null && state.nameTag.isValid()) {
+            state.nameTag.remove();
         }
         state.nameTag = null;
     }
@@ -1138,21 +1104,6 @@ final class CosmeticService implements Listener {
     public void onRide(EntityMountEvent event) {
         // ラクダやオウムガイに他の人が乗るのは止める。自分の頭へ乗せるときは乗り物がプレイヤーなのでここには来ない
         if (isOurs(event.getMount())) {
-            event.setCancelled(true);
-        }
-    }
-
-    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
-    public void onDismount(EntityDismountEvent event) {
-        // 安い判定を先に行い、PDC の読み取り(isOurs)は最後にする
-        if (allowDismount || !(event.getDismounted() instanceof Player player)) {
-            return;
-        }
-        // remove 済みの乗客は必ず降ろす。止めると消えたまま乗り続け、毎 tick 降車処理が走る
-        if (!event.getEntity().isValid()) {
-            return;
-        }
-        if (isOurs(event.getEntity()) && plugin.isPlayerInAnyZone(player.getLocation())) {
             event.setCancelled(true);
         }
     }
