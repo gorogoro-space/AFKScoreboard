@@ -779,11 +779,9 @@ public class AFKScoreboard extends JavaPlugin implements Listener {
         int days = totalHours / 24;
         int hours = totalHours % 24;
 
-        if (hours == 0 && minutes == 0) return days + "d";
-        if (minutes == 0) return days + "d" + hours + "h";
-        if (hours == 0) return days + "d" + minutes + "m";
-
-        return days + "d" + hours + "h" + minutes + "m";
+        // 1日以上は分を出さない
+        if (hours == 0) return days + "d";
+        return days + "d" + hours + "h";
     }
 
     /**
