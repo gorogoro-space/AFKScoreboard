@@ -607,9 +607,6 @@ public class AFKScoreboard extends JavaPlugin implements Listener {
             }
 
             String playerName = player.getName();
-            if (playerName.length() > 12) {
-                playerName = playerName.substring(0, 12);
-            }
             int sessionSeconds = entry.getValue();
 
             String currentStr = formatTimeCompact(sessionSeconds);
