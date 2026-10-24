@@ -25,6 +25,7 @@ import org.bukkit.entity.Cow;
 import org.bukkit.entity.Creeper;
 import org.bukkit.entity.Display;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.EntityType;
 import org.bukkit.entity.Fox;
 import org.bukkit.entity.Frog;
 import org.bukkit.entity.Goat;
@@ -53,6 +54,7 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.CreeperPowerEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityDropItemEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityMountEvent;
 import org.bukkit.event.entity.ExplosionPrimeEvent;
@@ -1104,6 +1106,14 @@ final class CosmeticService implements Listener {
     public void onRide(EntityMountEvent event) {
         // ラクダやオウムガイに他の人が乗るのは止める。自分の頭へ乗せるときは乗り物がプレイヤーなのでここには来ない
         if (isOurs(event.getMount())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onDropItem(EntityDropItemEvent event) {
+        // 頭の鶏が産む卵で、乗せている人のインベントリが埋まるので止める。鶏以外はすぐ抜ける
+        if (event.getEntity().getType() == EntityType.CHICKEN && isOurs(event.getEntity())) {
             event.setCancelled(true);
         }
     }
