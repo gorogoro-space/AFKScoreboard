@@ -53,6 +53,7 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.CreeperPowerEvent;
+import org.bukkit.event.entity.EntityCombustEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDropItemEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
@@ -1106,6 +1107,14 @@ final class CosmeticService implements Listener {
     public void onRide(EntityMountEvent event) {
         // ラクダやオウムガイに他の人が乗るのは止める。自分の頭へ乗せるときは乗り物がプレイヤーなのでここには来ない
         if (isOurs(event.getMount())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onCombust(EntityCombustEvent event) {
+        // ゾンビオウムガイなどのアンデッドが日光で燃えるので止める
+        if (isOurs(event.getEntity())) {
             event.setCancelled(true);
         }
     }
