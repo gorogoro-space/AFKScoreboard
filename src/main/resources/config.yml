@@ -14,3 +14,13 @@ thresholds:
   particle-seconds: 1800
   block-seconds: 3600
   mount-seconds: 10800
+
+# 乗客を降ろさずにテレポートするコマンド(先頭の / なし、小文字)。
+# 見た目(乗客)があると Paper が別ワールドへのテレポートを失敗させるので、これらのコマンドの直前だけ見た目を外す。
+teleport-commands:
+  - co teleport
+  - co tp
+  - core teleport
+  - core tp
+  - coreprotect teleport
+  - coreprotect tp

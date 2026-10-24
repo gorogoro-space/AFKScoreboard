@@ -1,6 +1,6 @@
 name: AFKScoreboard
 version: '${version}'
-softdepend: [AxAFKZone]
+softdepend: [AxAFKZone, floodgate]
 main: space.gorogoro.afkscoreboard.AFKScoreboard
 api-version: '1.21.11'
 description: This plugin works with AxAFKZone to display a ranking scoreboard based on AFK time.

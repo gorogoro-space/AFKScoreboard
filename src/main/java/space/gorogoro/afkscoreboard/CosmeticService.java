@@ -55,6 +55,7 @@ import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.CreeperPowerEvent;
 import org.bukkit.event.entity.EntityCombustEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityDismountEvent;
 import org.bukkit.event.entity.EntityDropItemEvent;
 import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityMountEvent;
@@ -62,6 +63,8 @@ import org.bukkit.event.entity.ExplosionPrimeEvent;
 import org.bukkit.event.entity.EntityTargetEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerBucketEntityEvent;
+import org.bukkit.event.player.PlayerCommandPreprocessEvent;
+import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerShearEntityEvent;
 import org.bukkit.persistence.PersistentDataType;
@@ -95,6 +98,20 @@ final class CosmeticService implements Listener {
     private static final float NAME_TAG_LIFT = 0.25f;
 
     private final Map<UUID, Active> active = new HashMap<>();
+    // Floodgate が無ければ null。そのときは統合版向けの名前の切り替えをしない
+    private final BedrockPlayers bedrock;
+    // 頭上 MOB を乗せたまま乗り物に乗った人。統合版は降りても本人の名前を隠したままにするので、降りたときに見せ直す
+    private final Set<UUID> seatedWithRider = new HashSet<>();
+    // 見た目を付け直さない人と、付け直してよくなる tick。別ワールドへのテレポートを乗客が邪魔しないように
+    private final Map<UUID, Integer> pausedUntil = new HashMap<>();
+    // teleport-commands の直後に待つ時間。CoreProtect は読み込み済みのチャンクへ次の tick で飛ぶ
+    private static final int COMMAND_PAUSE_TICKS = 10;
+    // 他のプラグインに見た目を降ろされてから、テレポートを待つ最長の時間。チャンクの生成に数秒かかることがある
+    private static final int DISMOUNT_PAUSE_TICKS = 200;
+    // 乗客を降ろさずにテレポートするコマンド。config.yml の teleport-commands を起動時に読む
+    private final List<String> teleportCommands = new ArrayList<>();
+    // 自分で見た目を外している間は true。そのときの降車は、他のプラグインのテレポートとして扱わない
+    private boolean selfDismounting;
     private int weekClock;
 
     CosmeticService(AFKScoreboard plugin) {
@@ -102,10 +119,34 @@ final class CosmeticService implements Listener {
         this.store = new CosmeticStore(plugin);
         this.tagKey = new NamespacedKey(plugin, "cosmetic");
         this.ownerKey = new NamespacedKey(plugin, "owner");
+        this.bedrock = BedrockPlayers.detect(plugin);
     }
 
     void load() {
         store.load();
+        teleportCommands.clear();
+        for (String entry : plugin.getConfig().getStringList("teleport-commands")) {
+            String normalized = normalizeCommand(entry);
+            if (!normalized.isEmpty()) {
+                teleportCommands.add(normalized);
+            }
+        }
+    }
+
+    /**
+     * 小文字にし、先頭の / と「プラグイン名:」を取り、空白を 1 つにまとめる。
+     */
+    private static String normalizeCommand(String text) {
+        String trimmed = text.trim().toLowerCase(java.util.Locale.ROOT);
+        if (trimmed.startsWith("/")) {
+            trimmed = trimmed.substring(1);
+        }
+        String[] parts = trimmed.split("\\s+");
+        if (parts.length == 0 || parts[0].isEmpty()) {
+            return "";
+        }
+        parts[0] = parts[0].substring(parts[0].indexOf(':') + 1);
+        return String.join(" ", parts);
     }
 
     void requestSave() {
@@ -121,7 +162,7 @@ final class CosmeticService implements Listener {
         for (World world : Bukkit.getWorlds()) {
             for (Entity entity : world.getEntities()) {
                 if (isOurs(entity)) {
-                    entity.remove();
+                    removeQuietly(entity);
                 }
             }
         }
@@ -146,10 +187,16 @@ final class CosmeticService implements Listener {
             }
         }
         Set<UUID> online = new HashSet<>();
+        int now = Bukkit.getCurrentTick();
+        pausedUntil.values().removeIf(until -> until <= now);
         for (Player player : Bukkit.getOnlinePlayers()) {
             online.add(player.getUniqueId());
             if (plugin.isPlayerInAnyZone(player.getLocation())) {
                 store.addSecond(player.getUniqueId());
+                if (pausedUntil.containsKey(player.getUniqueId())) {
+                    // コマンドの直後。テレポートが終わるまで付け直さない
+                    continue;
+                }
                 if (plugin.isHidden(player.getUniqueId()) || plugin.isConcealed(player)) {
                     clear(player);
                 } else {
@@ -164,6 +211,8 @@ final class CosmeticService implements Listener {
                 clear(null, uuid);
             }
         }
+        pausedUntil.keySet().retainAll(online);
+        seatedWithRider.retainAll(online);
     }
 
     /**
@@ -310,6 +359,12 @@ final class CosmeticService implements Listener {
                 continue;
             }
             boolean seated = player.isInsideVehicle();
+            if (hasRider) {
+                syncBedrockView(player, state);
+                if (seated && bedrock != null) {
+                    seatedWithRider.add(entry.getKey());
+                }
+            }
             // 座った・立ったときだけ高さを切り替える
             if (hasFloor && seated != state.floorLifted) {
                 liftDisplays(state, seated ? SEATED_FLOOR_LIFT : -SEATED_FLOOR_LIFT);
@@ -324,6 +379,33 @@ final class CosmeticService implements Listener {
                 continue;
             }
             faceMount(state.rider, look.getYaw(), look.getPitch());
+        }
+        // 見た目を外したあとに降りた人も含めて見る(統合版の本人の名前は、見た目の有無に関係なく隠れたまま)
+        if (!seatedWithRider.isEmpty()) {
+            seatedWithRider.removeIf(uuid -> {
+                Player player = Bukkit.getPlayer(uuid);
+                if (player == null) {
+                    return true;
+                }
+                if (player.isInsideVehicle()) {
+                    return false;
+                }
+                resendToBedrock(player);
+                return true;
+            });
+        }
+    }
+
+    /**
+     * 統合版の人に、このプレイヤーを出し直す。統合版は、乗客を乗せたまま乗り物に乗った人の名前を、降りても隠したままにする。
+     * 出し直すと入り直したときと同じ状態になり、本人の名前がまた出る。降りたときだけ呼ぶ。
+     */
+    private void resendToBedrock(Player player) {
+        for (Player viewer : Bukkit.getOnlinePlayers()) {
+            if (viewer != player && bedrock.is(viewer) && viewer.canSee(player)) {
+                viewer.hidePlayer(plugin, player);
+                viewer.showPlayer(plugin, player);
+            }
         }
     }
 
@@ -386,12 +468,6 @@ final class CosmeticService implements Listener {
                 }
             }
         }
-        // 透明な間(GSit の /lay など)はバニラと同じく名前を出さない。/lay では GSit の寝姿に名前が出るので二重になる
-        if (state.rider != null && state.rider.isValid()
-                && state.rider.isCustomNameVisible() == player.isInvisible()) {
-            state.rider.setCustomNameVisible(!player.isInvisible());
-        }
-
         syncNameTag(player, state);
     }
 
@@ -631,9 +707,7 @@ final class CosmeticService implements Listener {
         entity.setSilent(true);
         entity.setGravity(false);
         entity.setInvulnerable(true);
-        // 頭上の MOB でプレイヤーのネームタグが隠れるので、MOB の上に名前(色付き)を出す
-        entity.customName(player.displayName());
-        entity.setCustomNameVisible(true);
+        // 名前は MOB の customName ではなく、syncNameTag の TextDisplay を MOB に乗せて出す(統合版の人にだけ隠せるように)
         if (entity instanceof LivingEntity living) {
             living.setCollidable(false);
             living.setRemoveWhenFarAway(false);
@@ -949,7 +1023,7 @@ final class CosmeticService implements Listener {
     private void removeDisplays(Active state) {
         for (BlockDisplay display : state.displays) {
             if (display != null && display.isValid()) {
-                display.remove();
+                removeQuietly(display);
             }
         }
         state.displays.clear();
@@ -972,26 +1046,36 @@ final class CosmeticService implements Listener {
 
     private void removeRider(Active state) {
         if (state.rider != null && state.rider.isValid()) {
-            state.rider.remove();
+            removeQuietly(state.rider);
         }
         state.rider = null;
     }
 
     /**
-     * 何かが乗っているプレイヤーのネームタグは、クライアントが表示しない。
-     * ブロックだけが乗っている間は、代わりに名前の TextDisplay を頭の上に乗せる(頭上 MOB がいるときは MOB の名前で足りる)。
-     * 透明な間はバニラと同じく出さない。
+     * 何かが乗っているプレイヤーのネームタグは、Java 版のクライアントが表示しない。
+     * 代わりに名前の TextDisplay を、頭上 MOB がいれば MOB の上に、ブロックだけならプレイヤーの頭の上に乗せる。
+     * 透明な間(GSit の /lay など)はバニラと同じく出さない。/lay では GSit の寝姿に名前が出るので二重になる。
      */
     private void syncNameTag(Player player, Active state) {
-        boolean needed = !state.displays.isEmpty() && state.rider == null && !player.isInvisible();
+        boolean hasRider = state.rider != null && state.rider.isValid();
+        boolean needed = (hasRider || !state.displays.isEmpty()) && !player.isInvisible();
         if (!needed) {
             removeNameTag(state);
             return;
         }
+        Entity base = hasRider ? state.rider : player;
         if (state.nameTag != null && state.nameTag.isValid()) {
-            if (!player.getPassengers().contains(state.nameTag)) {
-                player.addPassenger(state.nameTag);
+            if (!base.getPassengers().contains(state.nameTag)) {
+                // MOB が出た・消えたときは乗せ先を変える
+                selfDismounting = true;
+                try {
+                    state.nameTag.leaveVehicle();
+                } finally {
+                    selfDismounting = false;
+                }
+                base.addPassenger(state.nameTag);
             }
+            syncBedrockView(player, state);
             return;
         }
         removeNameTag(state);
@@ -1018,22 +1102,81 @@ final class CosmeticService implements Listener {
         });
         // バニラと同じく、自分の名前は自分には見せない
         player.hideEntity(plugin, nameTag);
-        player.addPassenger(nameTag);
+        base.addPassenger(nameTag);
         state.nameTag = nameTag;
+        state.bedrockShown = null;
+        syncBedrockView(player, state);
+    }
+
+    /**
+     * 統合版は、乗客のいるプレイヤーでも、乗り物に乗っていなければ本人の名前を出す。乗っている間は出さない。
+     * (Geyser は BlockDisplay を送らないので、ブロックだけの人は統合版から見ると乗客がいない。)
+     * そこで統合版の人には、頭上 MOB がいて乗り物に乗っている間だけこちらの名前を見せ、それ以外は隠して名前を 1 つにする。
+     * 見せる・隠すを切り替えるのは、値が変わったときだけ。
+     */
+    private void syncBedrockView(Player owner, Active state) {
+        if (bedrock == null || state.nameTag == null || !state.nameTag.isValid()) {
+            return;
+        }
+        boolean show = state.rider != null && state.rider.isValid() && owner.isInsideVehicle();
+        if (state.bedrockShown != null && state.bedrockShown == show) {
+            return;
+        }
+        state.bedrockShown = show;
+        for (Player viewer : Bukkit.getOnlinePlayers()) {
+            if (viewer != owner && bedrock.is(viewer)) {
+                if (show) {
+                    viewer.showEntity(plugin, state.nameTag);
+                } else {
+                    viewer.hideEntity(plugin, state.nameTag);
+                }
+            }
+        }
+    }
+
+    /**
+     * 統合版の人がログインしたとき、隠す側の名前をその人から隠す(入ったばかりの人にはすべて見えているため)。
+     */
+    void onViewerJoin(Player viewer) {
+        if (bedrock == null || !bedrock.is(viewer)) {
+            return;
+        }
+        for (Map.Entry<UUID, Active> entry : active.entrySet()) {
+            Active state = entry.getValue();
+            if (entry.getKey().equals(viewer.getUniqueId()) || state.nameTag == null || !state.nameTag.isValid()
+                    || Boolean.TRUE.equals(state.bedrockShown)) {
+                continue;
+            }
+            viewer.hideEntity(plugin, state.nameTag);
+        }
     }
 
     private void removeNameTag(Active state) {
         if (state.nameTag != null && state.nameTag.isValid()) {
-            state.nameTag.remove();
+            removeQuietly(state.nameTag);
         }
         state.nameTag = null;
+        state.bedrockShown = null;
     }
 
     private void stripPassengers(Player player) {
         for (Entity passenger : new ArrayList<>(player.getPassengers())) {
             if (isOurs(passenger)) {
-                passenger.remove();
+                removeQuietly(passenger);
             }
+        }
+    }
+
+    /**
+     * 自前のエンティティを消す。消すときに出る降車イベントを、他のプラグインのテレポートと区別するため。
+     */
+    private void removeQuietly(Entity entity) {
+        boolean previous = selfDismounting;
+        selfDismounting = true;
+        try {
+            entity.remove();
+        } finally {
+            selfDismounting = previous;
         }
     }
 
@@ -1105,8 +1248,8 @@ final class CosmeticService implements Listener {
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onRide(EntityMountEvent event) {
-        // ラクダやオウムガイに他の人が乗るのは止める。自分の頭へ乗せるときは乗り物がプレイヤーなのでここには来ない
-        if (isOurs(event.getMount())) {
+        // ラクダやオウムガイに他の人が乗るのは止める。名前の TextDisplay を MOB に乗せるのは自前同士なので通す
+        if (isOurs(event.getMount()) && !isOurs(event.getEntity())) {
             event.setCancelled(true);
         }
     }
@@ -1127,6 +1270,61 @@ final class CosmeticService implements Listener {
         }
     }
 
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onCommand(PlayerCommandPreprocessEvent event) {
+        // Paper は乗客がいる人の別ワールドへのテレポートを、PlayerTeleportEvent より前に失敗させる。
+        // 乗客を降ろさずにテレポートするコマンド(teleport-commands)だけ、動く前に見た目を外す。見た目がない人はすぐ抜ける
+        Player player = event.getPlayer();
+        if (teleportCommands.isEmpty() || !active.containsKey(player.getUniqueId())) {
+            return;
+        }
+        String message = normalizeCommand(event.getMessage());
+        boolean matched = false;
+        for (String command : teleportCommands) {
+            if (message.equals(command) || message.startsWith(command + " ")) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            return;
+        }
+        clear(player);
+        UUID uuid = player.getUniqueId();
+        pausedUntil.put(uuid, Bukkit.getCurrentTick() + COMMAND_PAUSE_TICKS);
+        // 1 秒タスクを待たずに付け直す。続けてコマンドを打っていれば、最後のコマンドの予約に任せる
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            Integer until = pausedUntil.get(uuid);
+            if (until == null || until > Bukkit.getCurrentTick()) {
+                return;
+            }
+            pausedUntil.remove(uuid);
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null) {
+                refresh(online);
+            }
+        }, COMMAND_PAUSE_TICKS);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onDismount(EntityDismountEvent event) {
+        // Multiverse(passenger-mode: dismount_passengers)や EssentialsX は、乗客を降ろしてからテレポートする。
+        // チャンクの生成を待つ間に 1 秒タスクが乗せ直すと失敗するので、テレポートが起きるまで(最長 10 秒)乗せ直さない。
+        // 降車は止めない(止めると /tp や /home で飛べなくなる)。自分で外したときと、プレイヤー以外から降りたときはすぐ抜ける
+        if (selfDismounting || !(event.getDismounted() instanceof Player player) || !isOurs(event.getEntity())) {
+            return;
+        }
+        pausedUntil.put(player.getUniqueId(), Bukkit.getCurrentTick() + DISMOUNT_PAUSE_TICKS);
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onTeleport(PlayerTeleportEvent event) {
+        // 降ろされたあとのテレポートが済んだら、次の 1 秒タスクで付け直してよい(ゾーン外なら片付く)。見た目を止めていない人はすぐ抜ける
+        if (!pausedUntil.isEmpty()) {
+            pausedUntil.remove(event.getPlayer().getUniqueId());
+        }
+    }
+
     @EventHandler
     public void onDeath(PlayerDeathEvent event) {
         clear(event.getEntity());
@@ -1140,8 +1338,10 @@ final class CosmeticService implements Listener {
         // 座っている間だけ上げる足元側。体から生えている分は含めない
         private final List<BlockDisplay> floorDisplays = new ArrayList<>();
         private LivingEntity rider;
-        // ブロックだけが乗っている間に出す、ネームタグの代わりの名前
+        // 何かが乗っている間に出す、ネームタグの代わりの名前。頭上 MOB がいれば MOB に、いなければプレイヤーに乗せる
         private TextDisplay nameTag;
+        // 統合版の人に名前を見せているか。null はまだ反映していない
+        private Boolean bedrockShown;
         // 足元のブロックを座面の高さに上げているか
         private boolean floorLifted;
     }

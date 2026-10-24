@@ -757,6 +757,8 @@ public class AFKScoreboard extends JavaPlugin implements Listener {
         if (isPlayerInAnyZone(player.getLocation()) && !isConcealed(player)) {
             player.setScoreboard(afkScoreboard);
         }
+        // 統合版の人には、名前が 2 つにならないよう一部の名前を隠す
+        cosmetics.onViewerJoin(player);
     }
 
     /**
