@@ -1,5 +1,7 @@
 package space.gorogoro.afkscoreboard;
 
+import com.destroystokyo.paper.event.entity.EntityZapEvent;
+import io.papermc.paper.event.player.PlayerTrackEntityEvent;
 import org.bukkit.Bukkit;
 import org.bukkit.DyeColor;
 import org.bukkit.Keyed;
@@ -61,6 +63,7 @@ import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityMountEvent;
 import org.bukkit.event.entity.ExplosionPrimeEvent;
 import org.bukkit.event.entity.EntityTargetEvent;
+import org.bukkit.event.entity.EntityTransformEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerBucketEntityEvent;
 import org.bukkit.event.player.PlayerCommandPreprocessEvent;
@@ -102,8 +105,14 @@ final class CosmeticService implements Listener {
     private final BedrockPlayers bedrock;
     // 頭上 MOB を乗せたまま乗り物に乗った人。統合版は降りても本人の名前を隠したままにするので、降りたときに見せ直す
     private final Set<UUID> seatedWithRider = new HashSet<>();
+    // 頭上 MOB の出現を止められている人。警告は失敗が続く間に 1 回だけ出し、出せたら外す
+    private final Set<UUID> mountSpawnFailed = new HashSet<>();
+    // resendToBedrock で出し直している間は true。そのときの PlayerTrackEntityEvent は自分が起こしたものなので見ない
+    private boolean resending;
     // 見た目を付け直さない人と、付け直してよくなる tick。別ワールドへのテレポートを乗客が邪魔しないように
     private final Map<UUID, Integer> pausedUntil = new HashMap<>();
+    // 他のプラグインに降ろされた見た目を、次の tick に消す予約がある人
+    private final Set<UUID> dismountClearPending = new HashSet<>();
     // teleport-commands の直後に待つ時間。CoreProtect は読み込み済みのチャンクへ次の tick で飛ぶ
     private static final int COMMAND_PAUSE_TICKS = 10;
     // 他のプラグインに見た目を降ろされてから、テレポートを待つ最長の時間。チャンクの生成に数秒かかることがある
@@ -213,6 +222,7 @@ final class CosmeticService implements Listener {
         }
         pausedUntil.keySet().retainAll(online);
         seatedWithRider.retainAll(online);
+        mountSpawnFailed.retainAll(online);
     }
 
     /**
@@ -351,7 +361,8 @@ final class CosmeticService implements Listener {
             Active state = entry.getValue();
             boolean hasFloor = !state.floorDisplays.isEmpty();
             boolean hasRider = state.rider != null && state.rider.isValid();
-            if (!hasFloor && !hasRider) {
+            // 座ったまま MOB を外した人も見る(統合版の本人の名前が隠れたままになるため)
+            if (!hasFloor && !hasRider && state.seatedRider == null) {
                 continue;
             }
             Player player = Bukkit.getPlayer(entry.getKey());
@@ -359,6 +370,7 @@ final class CosmeticService implements Listener {
                 continue;
             }
             boolean seated = player.isInsideVehicle();
+            syncSeatedRider(player, state, seated, hasRider);
             if (hasRider) {
                 syncBedrockView(player, state);
                 if (seated && bedrock != null) {
@@ -397,15 +409,48 @@ final class CosmeticService implements Listener {
     }
 
     /**
-     * 統合版の人に、このプレイヤーを出し直す。統合版は、乗客を乗せたまま乗り物に乗った人の名前を、降りても隠したままにする。
-     * 出し直すと入り直したときと同じ状態になり、本人の名前がまた出る。降りたときだけ呼ぶ。
+     * 統合版は、乗り物に乗った情報を受け取った時点で頭に乗客がいれば本人の名前を隠し、次に受け取るまで変えない。
+     * 座ったまま頭上 MOB が出た・消えたら、統合版の人に出し直して今の状態で判定し直させる。
+     * seatedRider は、統合版が判定したときに MOB がいたか。null は座っていないか、まだわからない(再読み込み直後など)。
+     */
+    private void syncSeatedRider(Player player, Active state, boolean seated, boolean hasRider) {
+        if (bedrock == null) {
+            return;
+        }
+        if (!seated) {
+            state.seatedRider = null;
+            return;
+        }
+        if (state.seatedRider == null && !hasRider) {
+            // MOB なしで座っていれば、統合版は本人の名前を出している
+            state.seatedRider = false;
+            return;
+        }
+        if (state.seatedRider == null || state.seatedRider != hasRider) {
+            resendToBedrock(player);
+            state.seatedRider = hasRider;
+        }
+    }
+
+    /**
+     * 統合版の人に、このプレイヤーを出し直す。出し直すと入り直したときと同じく、乗り物に乗った情報が今の乗客の状態で届く。
+     * Paper は出し直すとき、本人の乗客(MOB)を先に、乗り物の情報を後に送るので、MOB がいれば名前は隠れる。
      */
     private void resendToBedrock(Player player) {
         for (Player viewer : Bukkit.getOnlinePlayers()) {
             if (viewer != player && bedrock.is(viewer) && viewer.canSee(player)) {
-                viewer.hidePlayer(plugin, player);
-                viewer.showPlayer(plugin, player);
+                resendTo(viewer, player);
             }
+        }
+    }
+
+    private void resendTo(Player viewer, Player player) {
+        resending = true;
+        try {
+            viewer.hidePlayer(plugin, player);
+            viewer.showPlayer(plugin, player);
+        } finally {
+            resending = false;
         }
     }
 
@@ -467,6 +512,10 @@ final class CosmeticService implements Listener {
                     store.requestSave();
                 }
             }
+        } else if (state.rider instanceof MushroomCow cow && record.mountVariant != null
+                && !record.mountVariant.equals(cow.getVariant().name())) {
+            // ムーシュルームは雷に打たれると色(赤・茶)が入れ替わる。止めるイベントが無いので、抽選した色に戻す
+            cow.setVariant(pickEnum(MushroomCow.Variant.class, record.mountVariant));
         }
         syncNameTag(player, state);
     }
@@ -513,6 +562,10 @@ final class CosmeticService implements Listener {
         }
         if (player != null) {
             stripPassengers(player);
+            // 座ったまま見た目を全部外すと 1 秒タスクで見なくなるので、ここで統合版の人に出し直す(名前が 0 個のままにならないように)
+            if (state != null && Boolean.TRUE.equals(state.seatedRider) && player.isInsideVehicle()) {
+                resendToBedrock(player);
+            }
         }
     }
 
@@ -685,11 +738,24 @@ final class CosmeticService implements Listener {
     }
 
     private LivingEntity spawnMount(Player player, CosmeticKinds.MountKind kind, String variant) {
+        // 頭の高さに出す。足元に出すと、統合版は出たばかりの魚の乗車情報を受け付けず、足元の床に残した(入り直すと頭に乗る)
+        Location spawnAt = player.getLocation().add(0.0, player.getHeight(), 0.0);
         Entity spawned = player.getWorld().spawnEntity(
-                player.getLocation(),
+                spawnAt,
                 kind.entityType,
                 CreatureSpawnEvent.SpawnReason.CUSTOM,
                 entity -> prepareMount(entity, player, kind, variant));
+        if (!spawned.isValid()) {
+            // 他のプラグインに出現を止められた。1 秒ごとにやり直すので、失敗が続く間は最初の 1 回だけ知らせる
+            if (mountSpawnFailed.add(player.getUniqueId())) {
+                plugin.getLogger().warning(String.format(
+                        "%s の頭MOB(%s)を出せませんでした。ほかのプラグインに出現を止められた可能性があります(%s %.1f %.1f %.1f)",
+                        player.getName(), kind.name(), spawnAt.getWorld().getName(),
+                        spawnAt.getX(), spawnAt.getY(), spawnAt.getZ()));
+            }
+            return null;
+        }
+        mountSpawnFailed.remove(player.getUniqueId());
         if (!(spawned instanceof LivingEntity living)) {
             spawned.remove();
             return null;
@@ -1254,9 +1320,61 @@ final class CosmeticService implements Listener {
         }
     }
 
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onSeat(EntityMountEvent event) {
+        // 乗った情報はこのあと統合版に届き、その時点の頭上 MOB の有無で名前が決まるので、出し直しは要らない
+        if (bedrock == null || !(event.getEntity() instanceof Player owner) || isOurs(event.getMount())) {
+            return;
+        }
+        Active state = active.get(owner.getUniqueId());
+        if (state != null) {
+            state.seatedRider = state.rider != null && state.rider.isValid();
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onTrack(PlayerTrackEntityEvent event) {
+        // 統合版の人が、座っている人より後に頭上 MOB を見始めると、MOB が乗り物の情報より後に届いて本人の名前が出てしまう。
+        // 次の tick にその人にだけ持ち主を出し直す。乗客でないエンティティと、統合版でない人はすぐ抜ける
+        if (bedrock == null || resending || !(event.getEntity().getVehicle() instanceof Player owner)) {
+            return;
+        }
+        Active state = active.get(owner.getUniqueId());
+        // 座ったまま MOB が出た直後(seatedRider が true になる前)は、全員への出し直しを tickSeated に任せる
+        if (state == null || state.rider != event.getEntity() || !Boolean.TRUE.equals(state.seatedRider)
+                || !owner.isInsideVehicle() || !bedrock.is(event.getPlayer())) {
+            return;
+        }
+        UUID viewerId = event.getPlayer().getUniqueId();
+        UUID ownerId = owner.getUniqueId();
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            Player viewer = Bukkit.getPlayer(viewerId);
+            Player online = Bukkit.getPlayer(ownerId);
+            if (viewer != null && online != null && online.isInsideVehicle() && viewer.canSee(online)) {
+                resendTo(viewer, online);
+            }
+        });
+    }
+
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onCombust(EntityCombustEvent event) {
         // ゾンビオウムガイなどのアンデッドが日光で燃えるので止める
+        if (isOurs(event.getEntity())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onTransform(EntityTransformEvent event) {
+        // 雷に打たれた豚がゾンビピグリンに、村人がウィッチに変わると、AI なし・無敵のまま自前の印のない MOB が残るので止める
+        if (isOurs(event.getEntity())) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onZap(EntityZapEvent event) {
+        // 雷での変身(豚・村人)は EntityTransformEvent とは別の HandlerList なので、ここでも止める
         if (isOurs(event.getEntity())) {
             event.setCancelled(true);
         }
@@ -1314,7 +1432,20 @@ final class CosmeticService implements Listener {
         if (selfDismounting || !(event.getDismounted() instanceof Player player) || !isOurs(event.getEntity())) {
             return;
         }
-        pausedUntil.put(player.getUniqueId(), Bukkit.getCurrentTick() + DISMOUNT_PAUSE_TICKS);
+        UUID uuid = player.getUniqueId();
+        pausedUntil.put(uuid, Bukkit.getCurrentTick() + DISMOUNT_PAUSE_TICKS);
+        // 降ろされた見た目はその場に残るので、次の tick にまとめて消す(イベントの中で消すと、また降車イベントが出る)。
+        // 乗客ごとにイベントが出るので、予約は 1 人 1 回。付け直しはテレポート後の 1 秒タスクに任せる。
+        // EssentialsX は降ろした直後の同じ tick にテレポートし、待ちが解除されているので、待ちの有無は見ない
+        if (dismountClearPending.add(uuid)) {
+            Bukkit.getScheduler().runTask(plugin, () -> {
+                dismountClearPending.remove(uuid);
+                Player online = Bukkit.getPlayer(uuid);
+                if (online != null) {
+                    clear(online);
+                }
+            });
+        }
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -1342,6 +1473,8 @@ final class CosmeticService implements Listener {
         private TextDisplay nameTag;
         // 統合版の人に名前を見せているか。null はまだ反映していない
         private Boolean bedrockShown;
+        // 統合版が座ったと判定したときに頭上 MOB がいたか。null は座っていないか、まだわからない
+        private Boolean seatedRider;
         // 足元のブロックを座面の高さに上げているか
         private boolean floorLifted;
     }
