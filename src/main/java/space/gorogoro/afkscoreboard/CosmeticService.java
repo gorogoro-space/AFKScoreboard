@@ -2,6 +2,7 @@ package space.gorogoro.afkscoreboard;
 
 import com.destroystokyo.paper.event.entity.EntityZapEvent;
 import io.papermc.paper.event.player.PlayerTrackEntityEvent;
+import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
 import org.bukkit.DyeColor;
 import org.bukkit.Keyed;
@@ -99,6 +100,10 @@ final class CosmeticService implements Listener {
     private static final float SEATED_FLOOR_LIFT = 0.75f;
     // 名前を出す高さ(頭の上からのずらし)。バニラのネームタグとほぼ同じ位置。実機で調整する
     private static final float NAME_TAG_LIFT = 0.25f;
+    // 鶏の上に名前を 2 段で乗せるときの高さ。本番の統合版で表示を確かめた値
+    private static final float CHICKEN_NAME_TAG_LIFT = 0.6f;
+    // 立っている人を見始めた統合版の人に、こちらの名前を見せるまで待つ時間。統合版は約 5〜8 秒で本人の名前を隠す(本番で確認)
+    private static final long STANDING_NAME_DELAY_TICKS = 120L;
 
     private final Map<UUID, Active> active = new HashMap<>();
     // Floodgate が無ければ null。そのときは統合版向けの名前の切り替えをしない
@@ -402,7 +407,12 @@ final class CosmeticService implements Listener {
                 if (player.isInsideVehicle()) {
                     return false;
                 }
-                resendToBedrock(player);
+                // 頭上 MOB がいれば、立っていてもこちらの名前を統合版に見せるので、本人の名前は隠れたままでよい。
+                // 本人を出し直すとスキンが外れる(スティーブになる)ことがあるので、MOB がいなくなった人だけ出し直す
+                Active state = active.get(uuid);
+                if (state == null || state.rider == null || !state.rider.isValid()) {
+                    resendToBedrock(player);
+                }
                 return true;
             });
         }
@@ -433,10 +443,15 @@ final class CosmeticService implements Listener {
     }
 
     /**
-     * 統合版の人に、このプレイヤーを出し直す。出し直すと入り直したときと同じく、乗り物に乗った情報が今の乗客の状態で届く。
-     * Paper は出し直すとき、本人の乗客(MOB)を先に、乗り物の情報を後に送るので、MOB がいれば名前は隠れる。
+     * 統合版の人に、このプレイヤーの乗り物に乗った情報を送り直し、今の乗客の状態で本人の名前を決め直させる。
+     * 座っていれば乗り物(GSit の座席など)を出し直す。本人を出し直すと、タブリストから一度消えてスキンが外れる(スティーブになる)ことがある。
+     * 乗り物がなければ本人を出し直す。Paper は出し直すとき、本人の乗客(MOB)を先に、乗り物の情報を後に送る。
      */
     private void resendToBedrock(Player player) {
+        // 停止中(onDisable の後片付け)は hidePlayer が例外になり、停止の処理が途中で止まる。次の起動時に出し直すので何もしない
+        if (!plugin.isEnabled()) {
+            return;
+        }
         for (Player viewer : Bukkit.getOnlinePlayers()) {
             if (viewer != player && bedrock.is(viewer) && viewer.canSee(player)) {
                 resendTo(viewer, player);
@@ -445,10 +460,16 @@ final class CosmeticService implements Listener {
     }
 
     private void resendTo(Player viewer, Player player) {
+        Entity vehicle = player.getVehicle();
         resending = true;
         try {
-            viewer.hidePlayer(plugin, player);
-            viewer.showPlayer(plugin, player);
+            if (vehicle != null) {
+                viewer.hideEntity(plugin, vehicle);
+                viewer.showEntity(plugin, vehicle);
+            } else {
+                viewer.hidePlayer(plugin, player);
+                viewer.showPlayer(plugin, player);
+            }
         } finally {
             resending = false;
         }
@@ -773,7 +794,8 @@ final class CosmeticService implements Listener {
         entity.setSilent(true);
         entity.setGravity(false);
         entity.setInvulnerable(true);
-        // 名前は MOB の customName ではなく、syncNameTag の TextDisplay を MOB に乗せて出す(統合版の人にだけ隠せるように)
+        // 名前は MOB の customName ではなく、syncNameTag の TextDisplay を MOB に乗せて出す(統合版の人にだけ隠せるように)。
+        // ラクダ・クリーパーだけは、上に乗せた名前を統合版が出さないので、syncNameTag で MOB に名前を付ける
         if (entity instanceof LivingEntity living) {
             living.setCollidable(false);
             living.setRemoveWhenFarAway(false);
@@ -1124,12 +1146,29 @@ final class CosmeticService implements Listener {
      */
     private void syncNameTag(Player player, Active state) {
         boolean hasRider = state.rider != null && state.rider.isValid();
-        boolean needed = (hasRider || !state.displays.isEmpty()) && !player.isInvisible();
+        // ラクダ・クリーパーは、上に乗せた名前を統合版が出さない(2 段にしても出ない)。名前の TextDisplay をやめ、MOB そのものに名前を付ける
+        boolean mobName = hasRider && usesMobName(state.rider);
+        if (hasRider) {
+            syncMobName(player, state.rider, mobName && !player.isInvisible());
+        }
+        boolean needed = (hasRider || !state.displays.isEmpty()) && !player.isInvisible() && !mobName;
         if (!needed) {
             removeNameTag(state);
             return;
         }
-        Entity base = hasRider ? state.rider : player;
+        // 鶏の上に直接乗せると、統合版は後から見始めた人に名前を出さない。文字のない TextDisplay を挟んで 2 段にする
+        boolean onChicken = hasRider && state.rider instanceof Chicken;
+        if (state.nameTag != null && state.nameTag.isValid() && state.nameTagOnChicken != onChicken) {
+            // 鶏とそれ以外で高さが違うので作り直す
+            removeNameTag(state);
+        }
+        Entity base;
+        if (onChicken) {
+            base = ensureSpacer(player, state);
+        } else {
+            removeSpacer(state);
+            base = hasRider ? state.rider : player;
+        }
         if (state.nameTag != null && state.nameTag.isValid()) {
             if (!base.getPassengers().contains(state.nameTag)) {
                 // MOB が出た・消えたときは乗せ先を変える
@@ -1144,8 +1183,11 @@ final class CosmeticService implements Listener {
             syncBedrockView(player, state);
             return;
         }
-        removeNameTag(state);
-        Location spawnAt = player.getLocation();
+        if (state.nameTag != null) {
+            removeQuietly(state.nameTag);
+        }
+        // 鶏のときは頭の高さに出す(足元に出すと、乗るまでの一瞬だけ床に名前が見える)
+        Location spawnAt = onChicken ? state.rider.getLocation() : player.getLocation();
         spawnAt.setYaw(0.0f);
         spawnAt.setPitch(0.0f);
         TextDisplay nameTag = player.getWorld().spawn(spawnAt, TextDisplay.class, entity -> {
@@ -1161,7 +1203,7 @@ final class CosmeticService implements Listener {
             entity.setShadowStrength(0.0f);
             entity.setInterpolationDuration(0);
             entity.setTransformation(new Transformation(
-                    new Vector3f(0.0f, NAME_TAG_LIFT, 0.0f),
+                    new Vector3f(0.0f, onChicken ? CHICKEN_NAME_TAG_LIFT : NAME_TAG_LIFT, 0.0f),
                     new Quaternionf(),
                     new Vector3f(1.0f, 1.0f, 1.0f),
                     new Quaternionf()));
@@ -1170,21 +1212,75 @@ final class CosmeticService implements Listener {
         player.hideEntity(plugin, nameTag);
         base.addPassenger(nameTag);
         state.nameTag = nameTag;
+        state.nameTagOnChicken = onChicken;
         state.bedrockShown = null;
         syncBedrockView(player, state);
     }
 
     /**
-     * 統合版は、乗客のいるプレイヤーでも、乗り物に乗っていなければ本人の名前を出す。乗っている間は出さない。
-     * (Geyser は BlockDisplay を送らないので、ブロックだけの人は統合版から見ると乗客がいない。)
-     * そこで統合版の人には、頭上 MOB がいて乗り物に乗っている間だけこちらの名前を見せ、それ以外は隠して名前を 1 つにする。
+     * 鶏の上に、名前を乗せるための文字のない TextDisplay を乗せる。
+     * Geyser は、名前の乗り物が TextDisplay のときだけ名前の高さ(translation)を統合版の位置に使う。
+     */
+    private Entity ensureSpacer(Player player, Active state) {
+        if (state.spacer != null && state.spacer.isValid() && state.rider.getPassengers().contains(state.spacer)) {
+            return state.spacer;
+        }
+        removeSpacer(state);
+        Location spawnAt = state.rider.getLocation();
+        spawnAt.setYaw(0.0f);
+        spawnAt.setPitch(0.0f);
+        TextDisplay spacer = player.getWorld().spawn(spawnAt, TextDisplay.class, entity -> {
+            tag(entity, player.getUniqueId());
+            entity.text(Component.empty());
+            entity.setPersistent(false);
+            entity.setInvulnerable(true);
+            entity.setGravity(false);
+            entity.setShadowRadius(0.0f);
+            entity.setShadowStrength(0.0f);
+        });
+        state.rider.addPassenger(spacer);
+        state.spacer = spacer;
+        return spacer;
+    }
+
+    private void removeSpacer(Active state) {
+        if (state.spacer != null && state.spacer.isValid()) {
+            removeQuietly(state.spacer);
+        }
+        state.spacer = null;
+    }
+
+    private static boolean usesMobName(Entity rider) {
+        return rider instanceof Camel || rider instanceof Creeper;
+    }
+
+    /**
+     * 頭上 MOB 自体の名前を、出すべきときだけ出す。Java 版は乗客のいない MOB の名前を出すので、こちらも 1 つになる。
+     */
+    private static void syncMobName(Player owner, LivingEntity rider, boolean show) {
+        if (show) {
+            if (rider.customName() == null || !rider.isCustomNameVisible()) {
+                rider.customName(owner.displayName());
+                rider.setCustomNameVisible(true);
+            }
+        } else if (rider.customName() != null) {
+            rider.customName(null);
+            rider.setCustomNameVisible(false);
+        }
+    }
+
+    /**
+     * 統合版は、頭上 MOB がいる人の本人の名前を、乗り物に乗っていれば隠し、立っていても見え始めて数秒後に隠す。
+     * (Geyser は BlockDisplay を送らないので、ブロックだけの人は統合版から見ると乗客がいない。本人の名前が出る。)
+     * そこで統合版の人には、頭上 MOB がいる間はこちらの名前を見せ、ブロックだけのときは隠して名前を 1 つにする。
+     * 立っている人を見始めたばかりの統合版の人には、本人の名前が消えるまで onTrack で遅らせて見せる。
      * 見せる・隠すを切り替えるのは、値が変わったときだけ。
      */
     private void syncBedrockView(Player owner, Active state) {
         if (bedrock == null || state.nameTag == null || !state.nameTag.isValid()) {
             return;
         }
-        boolean show = state.rider != null && state.rider.isValid() && owner.isInsideVehicle();
+        boolean show = state.rider != null && state.rider.isValid();
         if (state.bedrockShown != null && state.bedrockShown == show) {
             return;
         }
@@ -1223,6 +1319,7 @@ final class CosmeticService implements Listener {
         }
         state.nameTag = null;
         state.bedrockShown = null;
+        removeSpacer(state);
     }
 
     private void stripPassengers(Player player) {
@@ -1335,18 +1432,25 @@ final class CosmeticService implements Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onTrack(PlayerTrackEntityEvent event) {
         // 統合版の人が、座っている人より後に頭上 MOB を見始めると、MOB が乗り物の情報より後に届いて本人の名前が出てしまう。
-        // 次の tick にその人にだけ持ち主を出し直す。乗客でないエンティティと、統合版でない人はすぐ抜ける
+        // 次の tick にその人にだけ乗り物を出し直す。立っている人なら、こちらの名前を見せるのを遅らせる。
+        // 乗客でないエンティティと、統合版でない人はすぐ抜ける
         if (bedrock == null || resending || !(event.getEntity().getVehicle() instanceof Player owner)) {
             return;
         }
         Active state = active.get(owner.getUniqueId());
-        // 座ったまま MOB が出た直後(seatedRider が true になる前)は、全員への出し直しを tickSeated に任せる
-        if (state == null || state.rider != event.getEntity() || !Boolean.TRUE.equals(state.seatedRider)
-                || !owner.isInsideVehicle() || !bedrock.is(event.getPlayer())) {
+        if (state == null || state.rider != event.getEntity() || !bedrock.is(event.getPlayer())) {
             return;
         }
         UUID viewerId = event.getPlayer().getUniqueId();
         UUID ownerId = owner.getUniqueId();
+        if (!owner.isInsideVehicle()) {
+            delayNameTag(event.getPlayer(), owner, state);
+            return;
+        }
+        // 座ったまま MOB が出た直後(seatedRider が true になる前)は、全員への出し直しを tickSeated に任せる
+        if (!Boolean.TRUE.equals(state.seatedRider)) {
+            return;
+        }
         Bukkit.getScheduler().runTask(plugin, () -> {
             Player viewer = Bukkit.getPlayer(viewerId);
             Player online = Bukkit.getPlayer(ownerId);
@@ -1354,6 +1458,31 @@ final class CosmeticService implements Listener {
                 resendTo(viewer, online);
             }
         });
+    }
+
+    /**
+     * 統合版の人が、立っている人の頭上 MOB を見始めたとき(ログイン・接近)、統合版はしばらく本人の名前を出してから隠す。
+     * その間にこちらの名前も見せると 2 つになるので、その人にだけこちらの名前を隠し、本人の名前が消えるころに見せる。
+     * 出たばかりの MOB(付け替えなど)は、すでに見ている人なので遅らせない。
+     */
+    private void delayNameTag(Player viewer, Player owner, Active state) {
+        TextDisplay nameTag = state.nameTag;
+        if (nameTag == null || !nameTag.isValid() || state.rider.getTicksLived() < 20) {
+            return;
+        }
+        viewer.hideEntity(plugin, nameTag);
+        UUID viewerId = viewer.getUniqueId();
+        UUID ownerId = owner.getUniqueId();
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            Player online = Bukkit.getPlayer(viewerId);
+            Active now = active.get(ownerId);
+            // 待っている間に名前が作り直されていれば、作り直したときに見せ方を決め直しているので何もしない
+            if (online == null || now == null || now.nameTag != nameTag || !nameTag.isValid()
+                    || !Boolean.TRUE.equals(now.bedrockShown)) {
+                return;
+            }
+            online.showEntity(plugin, nameTag);
+        }, STANDING_NAME_DELAY_TICKS);
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
@@ -1471,6 +1600,10 @@ final class CosmeticService implements Listener {
         private LivingEntity rider;
         // 何かが乗っている間に出す、ネームタグの代わりの名前。頭上 MOB がいれば MOB に、いなければプレイヤーに乗せる
         private TextDisplay nameTag;
+        // nameTag を鶏の上に 2 段で乗せる高さで作ったか
+        private boolean nameTagOnChicken;
+        // 鶏と名前の間に挟む、文字のない TextDisplay
+        private TextDisplay spacer;
         // 統合版の人に名前を見せているか。null はまだ反映していない
         private Boolean bedrockShown;
         // 統合版が座ったと判定したときに頭上 MOB がいたか。null は座っていないか、まだわからない
