@@ -102,8 +102,8 @@ final class CosmeticService implements Listener {
     private static final float NAME_TAG_LIFT = 0.25f;
     // 鶏の上に名前を 2 段で乗せるときの高さ。本番の統合版で表示を確かめた値
     private static final float CHICKEN_NAME_TAG_LIFT = 0.6f;
-    // 立っている人を見始めた統合版の人に、こちらの名前を見せるまで待つ時間。統合版は約 5〜8 秒で本人の名前を隠す(本番で確認)
-    private static final long STANDING_NAME_DELAY_TICKS = 120L;
+    // 立っている人を見始めた統合版の人に、本人のスニークを変えて名前を決め直させるまで待つ時間。見え始めの情報が届いてから送る
+    private static final long STANDING_NAME_DELAY_TICKS = 10L;
 
     private final Map<UUID, Active> active = new HashMap<>();
     // Floodgate が無ければ null。そのときは統合版向けの名前の切り替えをしない
@@ -126,6 +126,8 @@ final class CosmeticService implements Listener {
     private final List<String> teleportCommands = new ArrayList<>();
     // 自分で見た目を外している間は true。そのときの降車は、他のプラグインのテレポートとして扱わない
     private boolean selfDismounting;
+    // スニークを 1 tick だけ変えている人と、戻す値。停止時にも戻す
+    private final Map<UUID, Boolean> sneakPulsing = new HashMap<>();
     private int weekClock;
 
     CosmeticService(AFKScoreboard plugin) {
@@ -168,6 +170,14 @@ final class CosmeticService implements Listener {
     }
 
     void shutdown() {
+        // 戻す前に止まると、しゃがんだままになる
+        for (Map.Entry<UUID, Boolean> entry : sneakPulsing.entrySet()) {
+            Player player = Bukkit.getPlayer(entry.getKey());
+            if (player != null) {
+                player.setSneaking(entry.getValue());
+            }
+        }
+        sneakPulsing.clear();
         removeAll();
         store.shutdown();
     }
@@ -525,6 +535,10 @@ final class CosmeticService implements Listener {
             removeRider(state);
             state.rider = spawnMount(player, mount, record.mountVariant);
             state.mount = mount;
+            if (state.rider != null && !player.isInsideVehicle()) {
+                // 立っている人の本人の名前は、MOB が付いても統合版が決め直さないので、スニークを変えて決め直させる
+                pulseSneakLater(player, 1L);
+            }
             if (state.rider != null) {
                 String variant = readVariant(state.rider);
                 if (variant != null && !variant.equals(record.mountVariant)) {
@@ -1270,10 +1284,10 @@ final class CosmeticService implements Listener {
     }
 
     /**
-     * 統合版は、頭上 MOB がいる人の本人の名前を、乗り物に乗っていれば隠し、立っていても見え始めて数秒後に隠す。
+     * 統合版は、頭上 MOB がいる人の本人の名前を、乗り物に乗ったときか本人の状態(スニークなど)が変わったときに隠す。
      * (Geyser は BlockDisplay を送らないので、ブロックだけの人は統合版から見ると乗客がいない。本人の名前が出る。)
      * そこで統合版の人には、頭上 MOB がいる間はこちらの名前を見せ、ブロックだけのときは隠して名前を 1 つにする。
-     * 立っている人を見始めたばかりの統合版の人には、本人の名前が消えるまで onTrack で遅らせて見せる。
+     * 立っている人は、MOB を出したときと、統合版の人が見始めたとき(onTrack)に、スニークを変えて本人の名前を隠させる。
      * 見せる・隠すを切り替えるのは、値が変わったときだけ。
      */
     private void syncBedrockView(Player owner, Active state) {
@@ -1432,7 +1446,7 @@ final class CosmeticService implements Listener {
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onTrack(PlayerTrackEntityEvent event) {
         // 統合版の人が、座っている人より後に頭上 MOB を見始めると、MOB が乗り物の情報より後に届いて本人の名前が出てしまう。
-        // 次の tick にその人にだけ乗り物を出し直す。立っている人なら、こちらの名前を見せるのを遅らせる。
+        // 次の tick にその人にだけ乗り物を出し直す。立っている人なら、少し待ってスニークを変えてから、こちらの名前を見せる。
         // 乗客でないエンティティと、統合版でない人はすぐ抜ける
         if (bedrock == null || resending || !(event.getEntity().getVehicle() instanceof Player owner)) {
             return;
@@ -1443,6 +1457,10 @@ final class CosmeticService implements Listener {
         }
         UUID viewerId = event.getPlayer().getUniqueId();
         UUID ownerId = owner.getUniqueId();
+        // 自分の MOB を自分で見始めたとき(ログイン直後など)は、自分の名前は見せないので何もしない
+        if (viewerId.equals(ownerId)) {
+            return;
+        }
         if (!owner.isInsideVehicle()) {
             delayNameTag(event.getPlayer(), owner, state);
             return;
@@ -1461,9 +1479,9 @@ final class CosmeticService implements Listener {
     }
 
     /**
-     * 統合版の人が、立っている人の頭上 MOB を見始めたとき(ログイン・接近)、統合版はしばらく本人の名前を出してから隠す。
-     * その間にこちらの名前も見せると 2 つになるので、その人にだけこちらの名前を隠し、本人の名前が消えるころに見せる。
-     * 出たばかりの MOB(付け替えなど)は、すでに見ている人なので遅らせない。
+     * 統合版の人が、立っている人の頭上 MOB を見始めたとき(ログイン・接近)、統合版は本人の名前を出したままにする。
+     * その人にだけこちらの名前を隠しておき、少し待ってから本人のスニークを変えて本人の名前を隠させ、こちらの名前を見せる。
+     * 出たばかりの MOB(付け替えなど)は、出したときにスニークを変えるので何もしない。
      */
     private void delayNameTag(Player viewer, Player owner, Active state) {
         TextDisplay nameTag = state.nameTag;
@@ -1475,14 +1493,50 @@ final class CosmeticService implements Listener {
         UUID ownerId = owner.getUniqueId();
         Bukkit.getScheduler().runTaskLater(plugin, () -> {
             Player online = Bukkit.getPlayer(viewerId);
+            Player ownerNow = Bukkit.getPlayer(ownerId);
             Active now = active.get(ownerId);
             // 待っている間に名前が作り直されていれば、作り直したときに見せ方を決め直しているので何もしない
-            if (online == null || now == null || now.nameTag != nameTag || !nameTag.isValid()
+            if (online == null || ownerNow == null || now == null || now.nameTag != nameTag || !nameTag.isValid()
                     || !Boolean.TRUE.equals(now.bedrockShown)) {
                 return;
             }
+            pulseSneak(ownerNow);
             online.showEntity(plugin, nameTag);
         }, STANDING_NAME_DELAY_TICKS);
+    }
+
+    private void pulseSneakLater(Player player, long delay) {
+        if (bedrock == null) {
+            return;
+        }
+        UUID uuid = player.getUniqueId();
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null && !online.isInsideVehicle()) {
+                pulseSneak(online);
+            }
+        }, delay);
+    }
+
+    /**
+     * 本人のスニークを 1 tick だけ変えて戻す。統合版は、本人の状態が変わったときに頭の乗客を見て本人の名前を出すか決め直す。
+     * 歩く・テレポート・MOB の付け替えでは決め直さない。1 tick なので、Java 版からも統合版からもしゃがんだようには見えない(本番で確認)。
+     */
+    private void pulseSneak(Player player) {
+        UUID uuid = player.getUniqueId();
+        if (sneakPulsing.containsKey(uuid)) {
+            return;
+        }
+        boolean original = player.isSneaking();
+        sneakPulsing.put(uuid, original);
+        player.setSneaking(!original);
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            Boolean restore = sneakPulsing.remove(uuid);
+            Player online = Bukkit.getPlayer(uuid);
+            if (restore != null && online != null) {
+                online.setSneaking(restore);
+            }
+        }, 1L);
     }
 
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
