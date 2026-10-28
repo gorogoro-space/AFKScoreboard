@@ -29,6 +29,7 @@ import org.bukkit.entity.Creeper;
 import org.bukkit.entity.Display;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Fish;
 import org.bukkit.entity.Fox;
 import org.bukkit.entity.Frog;
 import org.bukkit.entity.Goat;
@@ -88,6 +89,7 @@ import java.util.function.Consumer;
 
 /**
  * ゾーン内だけの見た目。パーティクルは間隔を空け、頭上のブロックと MOB は乗客なので毎 tick 動かさない。
+ * 魚だけは統合版で乗客として付いてこないので乗せず、本人が動いたときだけ頭の位置へ動かす。
  * エンダードラゴンは入れない。
  */
 final class CosmeticService implements Listener {
@@ -343,15 +345,50 @@ final class CosmeticService implements Listener {
     }
 
     /**
-     * 頭上の MOB の向き(左右・上下)をプレイヤーに合わせる。位置は動かさない。
-     * PlayerMoveEvent から、向きが変わったときだけ呼ばれる。MOB がいない人は Map を引いて抜ける。
+     * 頭上の MOB の向き(左右・上下)を、向きが変わったときだけプレイヤーに合わせる。乗客の MOB の位置は動かさない。
+     * 乗せずに動かす魚(follows)だけは、位置が変わっても頭の位置へ動かす。
+     * PlayerMoveEvent から呼ばれる。MOB がいない人は Map を引いて抜ける。
      */
-    void syncRotation(Player player, Location to) {
+    void syncMount(Player player, Location from, Location to) {
         Active state = active.get(player.getUniqueId());
         if (state == null || state.rider == null || !state.rider.isValid()) {
             return;
         }
-        faceMount(state.rider, to.getYaw(), to.getPitch());
+        if (follows(state.rider)) {
+            followHead(player, state, to);
+            return;
+        }
+        if (from.getYaw() != to.getYaw() || from.getPitch() != to.getPitch()) {
+            faceMount(state.rider, to.getYaw(), to.getPitch());
+        }
+    }
+
+    /**
+     * 統合版は、乗客になった魚(フグ・タラ・シャケ)を本人と一緒に動かさず、出た場所に置き去りにする(入り直しても同じ)。
+     * 魚は乗せずに、本人が動いたときに頭の位置へテレポートさせる。
+     */
+    private static boolean follows(Entity rider) {
+        return rider instanceof Fish;
+    }
+
+    /**
+     * 頭上 MOB が乗客として乗っているか。乗せずに動かす魚は含めない(統合版の名前の判定では、魚は乗客ではない)。
+     */
+    private static boolean riding(Active state) {
+        return state.rider != null && state.rider.isValid() && !follows(state.rider);
+    }
+
+    /**
+     * 乗せずに動かす魚を、at に立つ本人の頭の高さへ動かし、向きを合わせる。同じ位置と向きなら何もしない。
+     */
+    private static void followHead(Player player, Active state, Location at) {
+        Location head = at.clone().add(0.0, player.getHeight(), 0.0);
+        Location current = state.rider.getLocation();
+        if (head.getWorld() == current.getWorld() && head.getX() == current.getX() && head.getY() == current.getY()
+                && head.getZ() == current.getZ() && head.getYaw() == current.getYaw() && head.getPitch() == current.getPitch()) {
+            return;
+        }
+        state.rider.teleport(head);
     }
 
     /**
@@ -385,10 +422,12 @@ final class CosmeticService implements Listener {
                 continue;
             }
             boolean seated = player.isInsideVehicle();
-            syncSeatedRider(player, state, seated, hasRider);
+            // 乗せずに動かす魚は、統合版から見ると乗客ではないので、名前の判定では MOB なしとして扱う
+            boolean riding = riding(state);
+            syncSeatedRider(player, state, seated, riding);
             if (hasRider) {
                 syncBedrockView(player, state);
-                if (seated && bedrock != null) {
+                if (seated && riding && bedrock != null) {
                     seatedWithRider.add(entry.getKey());
                 }
             }
@@ -401,6 +440,10 @@ final class CosmeticService implements Listener {
                 continue;
             }
             Location look = player.getLocation();
+            if (!riding) {
+                followHead(player, state, look);
+                continue;
+            }
             Location current = state.rider.getLocation();
             if (look.getYaw() == current.getYaw() && look.getPitch() == current.getPitch()) {
                 continue;
@@ -420,7 +463,7 @@ final class CosmeticService implements Listener {
                 // 頭上 MOB がいれば、立っていてもこちらの名前を統合版に見せるので、本人の名前は隠れたままでよい。
                 // 本人を出し直すとスキンが外れる(スティーブになる)ことがあるので、MOB がいなくなった人だけ出し直す
                 Active state = active.get(uuid);
-                if (state == null || state.rider == null || !state.rider.isValid()) {
+                if (state == null || !riding(state)) {
                     resendToBedrock(player);
                 }
                 return true;
@@ -447,9 +490,27 @@ final class CosmeticService implements Listener {
             return;
         }
         if (state.seatedRider == null || state.seatedRider != hasRider) {
-            resendToBedrock(player);
+            resendSeatedLater(player);
             state.seatedRider = hasRider;
         }
+    }
+
+    /**
+     * 座ったまま乗客を変えたあと、次の tick に統合版の人へ座席を出し直す。
+     * Paper は乗客の変化を tick の最後に送るので、同じ tick に出し直すと、統合版は変わる前の乗客で本人の名前を決めてしまう。
+     */
+    private void resendSeatedLater(Player player) {
+        // 停止中は予約できない(次の起動時に出し直す)
+        if (!plugin.isEnabled()) {
+            return;
+        }
+        UUID uuid = player.getUniqueId();
+        Bukkit.getScheduler().runTaskLater(plugin, () -> {
+            Player online = Bukkit.getPlayer(uuid);
+            if (online != null && online.isInsideVehicle()) {
+                resendToBedrock(online);
+            }
+        }, 1L);
     }
 
     /**
@@ -531,12 +592,16 @@ final class CosmeticService implements Listener {
         if (mount == null) {
             removeRider(state);
             state.mount = null;
-        } else if (state.mount != mount || state.rider == null || !state.rider.isValid() || !player.getPassengers().contains(state.rider)) {
+        } else if (state.mount != mount || state.rider == null || !state.rider.isValid()
+                // 乗せずに動かす魚は、別のワールドに残っていたら出し直す
+                || (follows(state.rider) ? !state.rider.getWorld().equals(player.getWorld())
+                        : !player.getPassengers().contains(state.rider))) {
             removeRider(state);
             state.rider = spawnMount(player, mount, record.mountVariant);
             state.mount = mount;
             if (state.rider != null && !player.isInsideVehicle()) {
-                // 立っている人の本人の名前は、MOB が付いても統合版が決め直さないので、スニークを変えて決め直させる
+                // 立っている人の本人の名前は、MOB が付いても統合版が決め直さないので、スニークを変えて決め直させる。
+                // 乗せない魚に変わったときも、前の MOB で隠れた本人の名前を出させるために決め直させる
                 pulseSneakLater(player, 1L);
             }
             if (state.rider != null) {
@@ -597,9 +662,9 @@ final class CosmeticService implements Listener {
         }
         if (player != null) {
             stripPassengers(player);
-            // 座ったまま見た目を全部外すと 1 秒タスクで見なくなるので、ここで統合版の人に出し直す(名前が 0 個のままにならないように)
+            // 座ったまま見た目を全部外すと 1 秒タスクで見なくなるので、ここで統合版の人への出し直しを予約する(名前が 0 個のままにならないように)
             if (state != null && Boolean.TRUE.equals(state.seatedRider) && player.isInsideVehicle()) {
-                resendToBedrock(player);
+                resendSeatedLater(player);
             }
         }
     }
@@ -798,7 +863,10 @@ final class CosmeticService implements Listener {
         living.setSilent(true);
         Location look = player.getLocation();
         faceMount(living, look.getYaw(), look.getPitch());
-        player.addPassenger(living);
+        // 魚は乗せずに、本人が動いたときに頭の位置へ動かす(follows)
+        if (!follows(living)) {
+            player.addPassenger(living);
+        }
         return living;
     }
 
@@ -1172,8 +1240,12 @@ final class CosmeticService implements Listener {
         }
         // 鶏の上に直接乗せると、統合版は後から見始めた人に名前を出さない。文字のない TextDisplay を挟んで 2 段にする
         boolean onChicken = hasRider && state.rider instanceof Chicken;
-        if (state.nameTag != null && state.nameTag.isValid() && state.nameTagOnChicken != onChicken) {
-            // 鶏とそれ以外で高さが違うので作り直す
+        // 乗せずに動かす魚の人は、名前を本人に乗せ、魚の上に出るように魚の高さだけ上げる
+        boolean onPlayer = !hasRider || follows(state.rider);
+        float lift = onChicken ? CHICKEN_NAME_TAG_LIFT
+                : hasRider && onPlayer ? NAME_TAG_LIFT + (float) state.rider.getHeight() : NAME_TAG_LIFT;
+        if (state.nameTag != null && state.nameTag.isValid() && state.nameTagLift != lift) {
+            // 鶏・魚・それ以外で高さが違うので作り直す
             removeNameTag(state);
         }
         Entity base;
@@ -1181,7 +1253,7 @@ final class CosmeticService implements Listener {
             base = ensureSpacer(player, state);
         } else {
             removeSpacer(state);
-            base = hasRider ? state.rider : player;
+            base = onPlayer ? player : state.rider;
         }
         if (state.nameTag != null && state.nameTag.isValid()) {
             if (!base.getPassengers().contains(state.nameTag)) {
@@ -1217,7 +1289,7 @@ final class CosmeticService implements Listener {
             entity.setShadowStrength(0.0f);
             entity.setInterpolationDuration(0);
             entity.setTransformation(new Transformation(
-                    new Vector3f(0.0f, onChicken ? CHICKEN_NAME_TAG_LIFT : NAME_TAG_LIFT, 0.0f),
+                    new Vector3f(0.0f, lift, 0.0f),
                     new Quaternionf(),
                     new Vector3f(1.0f, 1.0f, 1.0f),
                     new Quaternionf()));
@@ -1226,7 +1298,7 @@ final class CosmeticService implements Listener {
         player.hideEntity(plugin, nameTag);
         base.addPassenger(nameTag);
         state.nameTag = nameTag;
-        state.nameTagOnChicken = onChicken;
+        state.nameTagLift = lift;
         state.bedrockShown = null;
         syncBedrockView(player, state);
     }
@@ -1294,7 +1366,8 @@ final class CosmeticService implements Listener {
         if (bedrock == null || state.nameTag == null || !state.nameTag.isValid()) {
             return;
         }
-        boolean show = state.rider != null && state.rider.isValid();
+        // 乗せずに動かす魚の人は、統合版から見ると乗客がいないので本人の名前が出る。ブロックだけの人と同じく隠す
+        boolean show = riding(state);
         if (state.bedrockShown != null && state.bedrockShown == show) {
             return;
         }
@@ -1439,7 +1512,7 @@ final class CosmeticService implements Listener {
         }
         Active state = active.get(owner.getUniqueId());
         if (state != null) {
-            state.seatedRider = state.rider != null && state.rider.isValid();
+            state.seatedRider = riding(state);
         }
     }
 
@@ -1482,10 +1555,23 @@ final class CosmeticService implements Listener {
      * 統合版の人が、立っている人の頭上 MOB を見始めたとき(ログイン・接近)、統合版は本人の名前を出したままにする。
      * その人にだけこちらの名前を隠しておき、少し待ってから本人のスニークを変えて本人の名前を隠させ、こちらの名前を見せる。
      * 出たばかりの MOB(付け替えなど)は、出したときにスニークを変えるので何もしない。
+     * ラクダ・クリーパーは名前の TextDisplay を使わず MOB に名前を付けているので、少し待ってスニークだけ変える。
      */
     private void delayNameTag(Player viewer, Player owner, Active state) {
+        if (state.rider.getTicksLived() < 20) {
+            return;
+        }
         TextDisplay nameTag = state.nameTag;
-        if (nameTag == null || !nameTag.isValid() || state.rider.getTicksLived() < 20) {
+        if (nameTag == null || !nameTag.isValid()) {
+            if (usesMobName(state.rider)) {
+                UUID ownerId = owner.getUniqueId();
+                Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                    Player ownerNow = Bukkit.getPlayer(ownerId);
+                    if (ownerNow != null && !ownerNow.isInsideVehicle()) {
+                        pulseSneak(ownerNow);
+                    }
+                }, STANDING_NAME_DELAY_TICKS);
+            }
             return;
         }
         viewer.hideEntity(plugin, nameTag);
@@ -1637,6 +1723,24 @@ final class CosmeticService implements Listener {
         if (!pausedUntil.isEmpty()) {
             pausedUntil.remove(event.getPlayer().getUniqueId());
         }
+        // 乗せずに動かす魚は、テレポートについて来ないので、飛んだ次の tick に頭へ動かす。別のワールドなら消して 1 秒タスクに出し直させる
+        Active state = active.get(event.getPlayer().getUniqueId());
+        if (state == null || state.rider == null || !follows(state.rider)) {
+            return;
+        }
+        UUID uuid = event.getPlayer().getUniqueId();
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            Player online = Bukkit.getPlayer(uuid);
+            Active now = active.get(uuid);
+            if (online == null || now == null || now.rider == null || !now.rider.isValid() || !follows(now.rider)) {
+                return;
+            }
+            if (now.rider.getWorld().equals(online.getWorld())) {
+                followHead(online, now, online.getLocation());
+            } else {
+                removeRider(now);
+            }
+        });
     }
 
     @EventHandler
@@ -1654,8 +1758,8 @@ final class CosmeticService implements Listener {
         private LivingEntity rider;
         // 何かが乗っている間に出す、ネームタグの代わりの名前。頭上 MOB がいれば MOB に、いなければプレイヤーに乗せる
         private TextDisplay nameTag;
-        // nameTag を鶏の上に 2 段で乗せる高さで作ったか
-        private boolean nameTagOnChicken;
+        // nameTag を作ったときの高さ(鶏の 2 段・魚の人・それ以外で違う)
+        private float nameTagLift;
         // 鶏と名前の間に挟む、文字のない TextDisplay
         private TextDisplay spacer;
         // 統合版の人に名前を見せているか。null はまだ反映していない

@@ -665,10 +665,9 @@ public class AFKScoreboard extends JavaPlugin implements Listener {
      */
     @EventHandler
     public void onPlayerMove(PlayerMoveEvent event) {
-        // 向きが変わったときだけ、頭上の MOB の向きを合わせる（MOB がいない人は Map を引いて抜ける）
-        if (cosmetics != null && (event.getFrom().getYaw() != event.getTo().getYaw()
-                || event.getFrom().getPitch() != event.getTo().getPitch())) {
-            cosmetics.syncRotation(event.getPlayer(), event.getTo());
+        // 向きが変わったら頭上の MOB の向きを、乗せずに動かす魚は位置も合わせる（MOB がいない人は Map を引いて抜ける）
+        if (cosmetics != null) {
+            cosmetics.syncMount(event.getPlayer(), event.getFrom(), event.getTo());
         }
 
         // ブロックの整数値の境界線を越えて移動したときだけ判定（負荷対策）
