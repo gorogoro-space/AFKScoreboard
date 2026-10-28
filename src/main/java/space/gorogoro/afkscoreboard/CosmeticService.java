@@ -461,7 +461,8 @@ final class CosmeticService implements Listener {
                     return false;
                 }
                 // 頭上 MOB がいれば、立っていてもこちらの名前を統合版に見せるので、本人の名前は隠れたままでよい。
-                // 本人を出し直すとスキンが外れる(スティーブになる)ことがあるので、MOB がいなくなった人だけ出し直す
+                // 本人を出し直すとスキンが外れる(スティーブになる)ことがあるので、MOB がいなくなった人だけ出し直す。
+                // 座ったまま MOB がいなくなった人は、座席を出し直したときにここから外している(resendSeatedLater)
                 Active state = active.get(uuid);
                 if (state == null || !riding(state)) {
                     resendToBedrock(player);
@@ -498,6 +499,8 @@ final class CosmeticService implements Listener {
     /**
      * 座ったまま乗客を変えたあと、次の tick に統合版の人へ座席を出し直す。
      * Paper は乗客の変化を tick の最後に送るので、同じ tick に出し直すと、統合版は変わる前の乗客で本人の名前を決めてしまう。
+     * 乗せた MOB がいない状態で出し直せば、統合版は本人の名前を出すので、立ったときに本人を出し直す対象(seatedWithRider)から外す。
+     * 出し直す前に立っていれば外さず、立ったときの処理で本人を出し直す。
      */
     private void resendSeatedLater(Player player) {
         // 停止中は予約できない(次の起動時に出し直す)
@@ -509,6 +512,11 @@ final class CosmeticService implements Listener {
             Player online = Bukkit.getPlayer(uuid);
             if (online != null && online.isInsideVehicle()) {
                 resendToBedrock(online);
+                Active state = active.get(uuid);
+                if (state == null || !riding(state)) {
+                    // 本人を出し直すとスキンが外れる(スティーブになる)ことがあるので、要らない出し直しはしない
+                    seatedWithRider.remove(uuid);
+                }
             }
         }, 1L);
     }
