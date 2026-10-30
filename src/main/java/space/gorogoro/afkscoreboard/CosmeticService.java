@@ -1559,6 +1559,22 @@ final class CosmeticService implements Listener {
         });
     }
 
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onTrackPlayer(PlayerTrackEntityEvent event) {
+        // 統合版の人に、頭上 MOB を乗せて立っている人の本人だけが見え直すと(ほかのプラグインがスキンを適用したときなど)、
+        // 統合版は本人の名前を出し直す。MOB の見え始めではないので onTrack は動かず、名前が 2 つのままになるので、
+        // MOB の見え始めと同じく、その人にだけこちらの名前を遅らせて、少し待ってからスニークを変える。
+        // プレイヤーでないエンティティと、統合版でない人はすぐ抜ける
+        if (bedrock == null || !(event.getEntity() instanceof Player owner)) {
+            return;
+        }
+        Active state = active.get(owner.getUniqueId());
+        if (state == null || !riding(state) || owner.isInsideVehicle() || !bedrock.is(event.getPlayer())) {
+            return;
+        }
+        delayNameTagNow(event.getPlayer(), owner, state);
+    }
+
     /**
      * 統合版の人が、立っている人の頭上 MOB を見始めたとき(ログイン・接近)、統合版は本人の名前を出したままにする。
      * その人にだけこちらの名前を隠しておき、少し待ってから本人のスニークを変えて本人の名前を隠させ、こちらの名前を見せる。
@@ -1569,6 +1585,14 @@ final class CosmeticService implements Listener {
         if (state.rider.getTicksLived() < 20) {
             return;
         }
+        delayNameTagNow(viewer, owner, state);
+    }
+
+    /**
+     * delayNameTag の本体。MOB が出たばかりかどうかは見ない。
+     * 本人だけが見え直したとき(onTrackPlayer)は、MOB を出したときのスニークの切り替えより後なので、出たばかりでも行う。
+     */
+    private void delayNameTagNow(Player viewer, Player owner, Active state) {
         TextDisplay nameTag = state.nameTag;
         if (nameTag == null || !nameTag.isValid()) {
             if (usesMobName(state.rider)) {
