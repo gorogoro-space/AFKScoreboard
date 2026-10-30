@@ -21,6 +21,7 @@ import org.bukkit.scoreboard.Criteria;
 import org.bukkit.scoreboard.DisplaySlot;
 import org.bukkit.scoreboard.Objective;
 import org.bukkit.scoreboard.RenderType;
+import org.bukkit.scoreboard.Score;
 import org.bukkit.scoreboard.Scoreboard;
 import org.bukkit.scoreboard.ScoreboardManager;
 
@@ -564,10 +565,6 @@ public class AFKScoreboard extends JavaPlugin implements Listener {
      * ランキングを計算してスコアボードを更新
      */
     private void updateLeaderboard() {
-        for (String entry : afkScoreboard.getEntries()) {
-            afkScoreboard.resetScores(entry);
-        }
-
         // 今ゾーンにいて、ランキング表示がオンの人を、今週の累計で並べる
         List<Map.Entry<UUID, Integer>> sortedTop10 = new ArrayList<>();
         for (Player online : Bukkit.getOnlinePlayers()) {
@@ -587,13 +584,16 @@ public class AFKScoreboard extends JavaPlugin implements Listener {
         // 初期値の動的計算: ヘッダー2行 ＋ ランクインしている人数
         // 誰もおらず「誰も放置していません」の1行を表示する場合は「2行 + 1行 = 3」になります
         int scoreValue = 2 + (sortedTop10.isEmpty() ? 1 : sortedTop10.size());
+        // 出す行と並び順(スコア)。最後にまとめて、変わった行だけ書き換える
+        Map<String, Integer> lines = new LinkedHashMap<>();
 
         // ヘッダー部分の設定
-        afkObjective.getScore("§7位 プレイヤー §b今週の放置").setScore(scoreValue--);
-        afkObjective.getScore("§8----------------------").setScore(scoreValue--);
+        lines.put("§7位 プレイヤー §b今週の放置", scoreValue--);
+        lines.put("§8----------------------", scoreValue--);
 
         if (sortedTop10.isEmpty()) {
-            afkObjective.getScore("§7 現在、誰も放置していません").setScore(scoreValue--);
+            lines.put("§7 現在、誰も放置していません", scoreValue--);
+            applyBoardLines(lines);
             return;
         }
 
@@ -612,8 +612,27 @@ public class AFKScoreboard extends JavaPlugin implements Listener {
             String currentStr = formatTimeCompact(sessionSeconds);
             String scoreLine = String.format("§7#%d §f%s §b%s", rank, playerName, currentStr);
 
-            afkObjective.getScore(scoreLine).setScore(scoreValue--);
+            lines.put(scoreLine, scoreValue--);
             rank++;
+        }
+        applyBoardLines(lines);
+    }
+
+    /**
+     * サイドバーの行を書き換える。統合版(Geyser)は行を消すと一瞬サイドバーが空になり、ちらついて見えるので、
+     * 要らなくなった行だけ消し、無い行と順番(スコア)が変わった行だけ書く。同じ内容の行には触らない。
+     */
+    private void applyBoardLines(Map<String, Integer> lines) {
+        for (String entry : afkScoreboard.getEntries()) {
+            if (!lines.containsKey(entry)) {
+                afkScoreboard.resetScores(entry);
+            }
+        }
+        for (Map.Entry<String, Integer> line : lines.entrySet()) {
+            Score score = afkObjective.getScore(line.getKey());
+            if (!score.isScoreSet() || score.getScore() != line.getValue()) {
+                score.setScore(line.getValue());
+            }
         }
     }
 
